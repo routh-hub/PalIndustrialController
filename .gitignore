@@ -1,3 +1,6 @@
 /.local/
 /*.zip
 /PalIndustrialController/targets-*.tsv*
+/PalIndustrialController/orders-*.tsv*
+/PalIndustrialController/config-*.tsv*
+/PalIndustrialController/blueprint-*.tsv*

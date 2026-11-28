@@ -1,7 +1,9 @@
 local M = {}
 
 function M.valid(object)
-    return object and object:IsValid()
+    if not object then return false end
+    local ok, valid = pcall(function() return object:IsValid() end)
+    return ok and valid == true
 end
 
 function M.guid(value)
@@ -41,7 +43,7 @@ function M.player()
     if M.valid(camp) and camp:IsAvailable() and M.guid(camp:GetGroupIdBelongTo()) == guild then
         currentCamp = M.guid(camp:GetId())
     end
-    return { pc = pc, playerState = playerState, playerId = playerId, guild = guild, world = world,
+    return { pc = pc, pawn = pawn, playerState = playerState, playerId = playerId, guild = guild, world = world,
         currentCamp = currentCamp, baseManager = manager, mapManager = mapManager }
 end
 
@@ -87,7 +89,7 @@ local function registeredCamp(context, model, camps)
     if not M.valid(parent) then return end
     local process = parent.BuildProcess
     if M.valid(process) and not process:IsCompleted() then return end
-    return camp, key
+    return camp, key, parent
 end
 
 local function readStorage(context, camps, snapshot)
@@ -106,6 +108,7 @@ local function readStorage(context, camps, snapshot)
                     elseif not storage then
                         storage = { camp = camp.id, stock = {} }
                         snapshot.storage[key] = storage
+                        camp.storageIds[#camp.storageIds + 1] = key
                         local slots = container.ItemSlotArray
                         local size = #slots
                         if size > 4096 then error("仓库格数异常") end
@@ -128,6 +131,82 @@ local function readStorage(context, camps, snapshot)
     end
 end
 
+local function inferSuitabilityFromMaster(masterId)
+    if not masterId then return nil end
+    local lower = masterId:lower()
+    if lower:find("blastfurnace", 1, true) or lower:find("furnace", 1, true) or lower:find("cooking", 1, true)
+        or lower:find("campfire", 1, true) or lower:find("kitchen", 1, true) or lower:find("pot", 1, true)
+        or lower:find("cauldron", 1, true) or lower:find("stove", 1, true) or lower:find("oven", 1, true) then
+        return 1 -- EPalWorkSuitability::EmitFlame
+    end
+    if lower:find("crusher", 1, true) or lower:find("mill", 1, true) or lower:find("flour", 1, true) then
+        return 2 -- EPalWorkSuitability::Watering
+    end
+    if lower:find("medicine", 1, true) or lower:find("pharmacy", 1, true) or lower:find("alchemy", 1, true) then
+        return 10 -- EPalWorkSuitability::ProductMedicine
+    end
+    if lower:find("workbench", 1, true) or lower:find("factory", 1, true) or lower:find("weapon", 1, true)
+        or lower:find("sphere", 1, true) or lower:find("gear", 1, true) or lower:find("anvil", 1, true)
+        or lower:find("bench", 1, true) or lower:find("assembly", 1, true) or lower:find("conveyor", 1, true) then
+        return 5 -- EPalWorkSuitability::Handcraft
+    end
+    return nil
+end
+
+local function readStationRuntime(model, parent, station)
+    pcall(function()
+        if M.valid(parent) and parent.MapObjectMasterDataId then
+            station.masterId = M.name(parent.MapObjectMasterDataId)
+        end
+    end)
+    pcall(function()
+        if model.GetEnergyModule then
+            local energy = model:GetEnergyModule()
+            if M.valid(energy) then
+                local required = energy:IsRequiredEnergy()
+                station.energyRequired = required == true
+                if station.energyRequired then
+                    -- EPalMapObjectEnergyModuleStatusType: 0=Providable, 1=Waiting
+                    station.energyWaiting = energy:GetCurrentState() == 1
+                end
+            end
+        end
+    end)
+    pcall(function()
+        if model.GetWorkeeModule then
+            local workee = model:GetWorkeeModule()
+            if M.valid(workee) then
+                station.cannotApproach = workee:CannotApproachByWork() == true
+                local work = workee:GetWork()
+                if M.valid(work) then
+                    local okInfo, info = pcall(function()
+                        local out = {}
+                        work:GetWorkAssignInfo(out)
+                        return out
+                    end)
+                    if okInfo and type(info) == "table" then
+                        station.assignedWorkers = #info
+                    end
+                    local okSuit, suit = pcall(function()
+                        if work.GetWorkSuitability then return work:GetWorkSuitability() end
+                    end)
+                    if okSuit and type(suit) == "number" and suit >= 1 and suit <= 13 then
+                        station.workSuitability = suit
+                    end
+                end
+                local progress = workee:GetWorkProgress()
+                if M.valid(progress) then
+                    local okRate, rate = pcall(function() return progress:GetProgressRate() end)
+                    if okRate and type(rate) == "number" then station.workProgress = rate end
+                end
+            end
+        end
+    end)
+    if not station.workSuitability then
+        station.workSuitability = inferSuitabilityFromMaster(station.masterId)
+    end
+end
+
 local function readStations(context, camps, snapshot)
     local utility = StaticFindObject("/Script/Pal.Default__PalMasterDataTablesUtility")
     local access = utility:GetItemRecipeDataTableAccess(context.pc)
@@ -135,6 +214,7 @@ local function readStations(context, camps, snapshot)
     local technology = context.playerState:GetTechnologyData()
     if not M.valid(technology) then error("科技列表还未就绪") end
     local checkedRecipe = {}
+    local craftable = {}
     local function recipe(id)
         if not id then return nil end
         if not checkedRecipe[id] then
@@ -144,15 +224,19 @@ local function readStations(context, camps, snapshot)
         return snapshot.recipes[id]
     end
     for _, model in ipairs(FindAllOf("PalMapObjectConvertItemModel") or {}) do
-        local camp, id = registeredCamp(context, model, camps)
+        local camp, id, parent = registeredCamp(context, model, camps)
         if camp and not snapshot.stationIds[id] then
             local station = { id = id, camp = camp.id, recipes = {}, model = model }
             local ids = model.RecipeIds
             for i = 1, #ids do
                 local recipeId = M.name(ids[i])
-                if recipeId and technology:IsUnlockCraftRecipe(FName(recipeId)) and not technology:IsDeniedRecipe(FName(recipeId)) then
-                    local row = recipe(recipeId)
-                    if row then station.recipes[recipeId] = true end
+                if recipeId then
+                    if craftable[recipeId] == nil then
+                        local name = FName(recipeId)
+                        craftable[recipeId] = technology:IsUnlockCraftRecipe(name)
+                            and not technology:IsDeniedRecipe(name) and recipe(recipeId) ~= nil
+                    end
+                    if craftable[recipeId] then station.recipes[recipeId] = true end
                 end
             end
             local current = recipe(M.name(model:GetCurrentRecipeId()))
@@ -161,22 +245,35 @@ local function readStations(context, camps, snapshot)
             local item, amount = nil, 0
             if M.valid(outputSlot) then
                 item, amount = readSlot(outputSlot)
-                addStock(snapshot.pending, item, amount)
+                addStock(snapshot.buffered, item, amount)
             end
             if current and remaining > 0 then
-                addStock(snapshot.pending, current.output, remaining * current.count)
+                station.queueItem, station.queueCount = current.output, remaining * current.count
+                addStock(snapshot.queued, station.queueItem, station.queueCount)
+            elseif current and remaining < 0 then
+                snapshot.unknownPending[current.output] = true
+                station.queueItem, station.queueUnknown = current.output, true
+            elseif remaining ~= 0 then
+                snapshot.incomplete = true
             end
+            station.outputItem, station.outputCount = item, amount
+            station.activeRecipe = current and current.id
             station.idle = remaining == 0 and amount == 0 and current == nil
+            readStationRuntime(model, parent, station)
             snapshot.stations[#snapshot.stations + 1] = station
-            snapshot.stationIds[id] = true
+            snapshot.stationIds[id] = station
+            camp.stationCount = (camp.stationCount or 0) + 1
         end
     end
     table.sort(snapshot.stations, function(a, b) return a.id < b.id end)
 end
 
 function M.snapshot(context)
-    local snapshot = { camps = {}, stock = {}, storage = {}, pending = {}, stations = {}, stationIds = {}, recipes = {}, chests = 0 }
-    local camps = {}
+    local snapshot = {
+        camps = {}, campById = {}, stock = {}, storage = {}, stations = {}, stationIds = {}, recipes = {}, chests = 0,
+        queued = {}, buffered = {}, inTransit = {}, awaiting = {}, unknownPending = {}, manualReview = {},
+    }
+    local camps = snapshot.campById
     local baseIds = context.playerState.GuildBelongTo.BaseCampIds
     for i = 1, #baseIds do
         local guid = baseIds[i]
@@ -184,16 +281,25 @@ function M.snapshot(context)
         local result = {}
         local found = context.baseManager:TryGetModel(guid, result)
         local model = result.OutModel
-        if not found or not M.valid(model) then
+        if not id or not found or not M.valid(model) or not model:IsAvailable()
+            or M.guid(model:GetGroupIdBelongTo()) ~= context.guild then
             snapshot.incomplete = true
-        elseif id and not camps[id] and model:IsAvailable() and M.guid(model:GetGroupIdBelongTo()) == context.guild then
-            local camp = { id = id, stock = {}, containers = {} }
+        elseif not camps[id] then
+            local named, name = pcall(function() return model:GetBaseCampName():ToString() end)
+            local camp = { id = id, name = named and name ~= "" and name or id, stationCount = 0, chestCount = 0,
+                stock = {}, containers = {}, storageIds = {} }
             camps[id] = camp
             snapshot.camps[#snapshot.camps + 1] = camp
         end
     end
     table.sort(snapshot.camps, function(a, b) return a.id < b.id end)
     readStorage(context, camps, snapshot)
+    for _, camp in ipairs(snapshot.camps) do
+        table.sort(camp.storageIds)
+        camp.chestCount = #camp.storageIds
+        camp.storageKey = table.concat(camp.storageIds, ",")
+        camp.storageIds = nil
+    end
     readStations(context, camps, snapshot)
     return snapshot
 end
@@ -224,33 +330,35 @@ local function prepareOrder(context, station, recipe, batches)
     end
     local result = view:CanStartProduction()
     if result ~= 0 then
-        local reasons = { [1] = "配方不可用", [2] = "设备脱离加载范围", [3] = "能源模块不可用",
-            [4] = "原版判定缺少材料", [5] = "能源不足" }
-        return nil, reasons[result] or ("原版生产校验返回 " .. tostring(result))
+        local reasons = { [1] = { "配方不可用", "recipe" }, [2] = { "设备脱离加载范围", "access" },
+            [3] = { "能源模块不可用", "energy" }, [4] = { "原版判定缺少材料", "material" },
+            [5] = { "能源不足", "energy" } }
+        local reason = reasons[result]
+        if reason then return nil, reason[1], reason[2] end
+        return nil, "原版生产校验返回 " .. tostring(result), "unknown"
     end
     return view
 end
 
-function M.startOrder(context, station, recipe, batches, enableTransport)
+function M.startOrder(context, station, recipe, batches, beforeRequest)
     local factory = station.model
     if not station.idle or not station.recipes[recipe.id] or not M.valid(factory) or factory.bDisposed then
         return nil, "设备已变动"
     end
     if context.currentCamp ~= station.camp then return nil, "等待进入生产据点" end
     if M.guid(factory:GetBaseCampIdBelongTo()) ~= station.camp then return nil, "设备已移动" end
-    if M.name(factory:GetCurrentRecipeId()) or factory:GetRemainCreateNum() ~= 0 then return nil, "设备已接单" end
-    local view, why = prepareOrder(context, station, recipe, batches)
-    if not view then return nil, why end
-    if enableTransport and not factory:IsTransportToStorage() then
+    local output = factory:GetProductSlot()
+    if M.name(factory:GetCurrentRecipeId()) or factory:GetRemainCreateNum() ~= 0
+        or (M.valid(output) and output.StackCount ~= 0) then return nil, "设备已接单", "queue" end
+    local view, why, code = prepareOrder(context, station, recipe, batches)
+    if not view then return nil, why, code end
+    beforeRequest()
+    if not factory:IsTransportToStorage() then
         view:UpdateProductSetting_TransportToStorage(true)
     end
     view:StartProduction()
     return M.name(factory:GetCurrentRecipeId()) == recipe.id and factory:GetRemainCreateNum() > 0,
         "已提交原版订单，等待设备确认"
-end
-
-local function campById(snapshot, id)
-    for _, camp in ipairs(snapshot.camps) do if camp.id == id then return camp end end
 end
 
 local function destinationSlot(container, item)
@@ -265,9 +373,10 @@ local function destinationSlot(container, item)
     return empty
 end
 
-function M.move(context, snapshot, request)
-    local source, destination = campById(snapshot, request.source), campById(snapshot, request.destination)
+function M.move(context, snapshot, request, beforeRequest)
+    local source, destination = snapshot.campById[request.source], snapshot.campById[request.destination]
     if not source or not destination or source.id == destination.id then return nil, "调拨路径不可用" end
+    if context.currentCamp ~= destination.id then return nil, "等待进入调拨目标据点", "access" end
     local item = FName(request.item)
     local utility = StaticFindObject("/Script/Pal.Default__PalUtility")
     local transmitter = utility:GetNetworkTransmitter(context.pc)
@@ -286,7 +395,9 @@ function M.move(context, snapshot, request)
                             local beforeSource = from:GetItemStackCount64(item)
                             local beforeDestination = into:GetItemStackCount64(item)
                             local amount = math.min(available, request.amount)
-                            network:RequestMoveToContainer_ToServer(guidLibrary:NewGuid(), into:GetId(),
+                            local ticket = guidLibrary:NewGuid()
+                            beforeRequest(amount)
+                            network:RequestMoveToContainer_ToServer(ticket, into:GetId(),
                                 { { SlotId = slot:GetSlotId(), Num = amount } })
                             local removed = beforeSource - from:GetItemStackCount64(item)
                             local received = into:GetItemStackCount64(item) - beforeDestination
